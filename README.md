@@ -4,7 +4,7 @@ A fully simulated building-automation project: a four-room house whose temperatu
 per-room PID loops that drive a heating valve and a ventilation fan. Everything talks over MQTT, is logged to
 PostgreSQL, and is visualised in Grafana and in a live React floor-plan dashboard. No hardware required.
 
-![Floor-plan dashboard](docs/screenshots/dashboard.png)
+![Floor-plan dashboard: the bedroom is occupied and its fan holds CO2 at the 1000 ppm setpoint](docs/screenshots/dashboard-bedroom.png)
 
 ## Features
 
@@ -124,9 +124,14 @@ range hood.
 
 ## Screenshots
 
-| Grafana overview | Setpoint step response |
-|---|---|
-| ![Grafana overview](docs/screenshots/grafana-overview.png) | ![CO2 setpoint step response](docs/screenshots/setpoint-step-response.png) |
+Floor-plan dashboard, kitchen ventilating after morning cooking (live MQTT data):
+
+![Floor-plan dashboard: the kitchen fan runs to bring CO2 back down](docs/screenshots/dashboard-kitchen.png)
+
+Grafana overview of all four rooms. The kitchen temperature peak is cooking heat; the living-room CO2 plateau at
+1200 ppm comes from raising its CO2 setpoint by hand, and the fan stops and restarts accordingly:
+
+![Grafana overview of temperature, CO2, heating valve and fan in all four rooms](docs/screenshots/grafana-overview.png)
 
 ## Project structure
 
