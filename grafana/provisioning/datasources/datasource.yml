@@ -1,0 +1,16 @@
+apiVersion: 1
+datasources:
+  - name: Climate DB
+    uid: climate-pg
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    user: climate
+    isDefault: true
+    secureJsonData:
+      password: climate
+    jsonData:
+      database: climate
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: false

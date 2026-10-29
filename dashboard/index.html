@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Smart home climate control</title>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--paper:#e9eef1;--card:#f8fafb;--ink:#1b2b3a;--mute:#66798a;--line:#c5d0d8;--cool:#3a8fb7;--ok:#2f8f6b;--demo:#b8741a}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.45 "Instrument Sans",system-ui,sans-serif}
+.wrap{max-width:1200px;margin:0 auto;padding:24px 20px 40px}
+header{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:18px}
+h1{font-size:28px;margin:0;letter-spacing:-.02em}header p{margin:4px 0 0;color:var(--mute)}
+.badge{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border:1px solid var(--line);border-radius:999px;background:var(--card);font-size:13px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--mute)}
+.live .dot{background:var(--ok);animation:pulse 1.6s infinite}.demo .dot{background:var(--demo)}
+@keyframes pulse{50%{opacity:.25}}
+.grid{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);gap:16px}
+@media(max-width:900px){.grid,.charts{grid-template-columns:1fr!important}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:16px}
+.card h2{font-size:15px;margin:0 0 10px;font-weight:600}
+.plan{width:100%;height:auto;display:block}.room{cursor:pointer}.room:focus-visible{outline:none}
+.room:focus-visible rect:first-child{stroke:#3a8fb7}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}
+.stat b{display:block;font:500 28px "DM Mono",monospace;letter-spacing:-.03em}.stat span{color:var(--mute);font-size:13px}.stat small{font:400 12px "DM Mono",monospace;color:var(--mute)}
+.ctl label{display:flex;justify-content:space-between;font-size:14px;margin-top:10px}.ctl output{font-family:"DM Mono",monospace}
+input[type=range]{width:100%;accent-color:var(--ink)}
+.seg{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden;margin-top:6px}
+.seg button{flex:1;padding:8px;border:0;background:transparent;font:inherit;cursor:pointer;color:var(--mute)}
+.seg button[aria-pressed=true]{background:var(--ink);color:#fff}
+button:focus-visible,input:focus-visible{outline:2px solid var(--cool);outline-offset:2px}
+.charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:16px}
+.cap{display:flex;justify-content:space-between;font-size:13px;color:var(--mute)}
+.fan{transform-box:fill-box;transform-origin:center;animation:spin var(--d,0s) linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){.fan,.dot{animation:none}}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.26.4/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useRef}=React;
+const Q=new URLSearchParams(location.search);
+const HOST=Q.get("host")||"localhost", BASE=Q.get("topic")||"building/f1";
+const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
+const NAMES={living_room:"Living room",kitchen:"Kitchen",bedroom:"Bedroom",study:"Study"};
+const GEO={living_room:[30,30,360,180],kitchen:[390,30,220,180],bedroom:[30,210,260,160],study:[290,210,320,160]};
+const blank=()=>({temperature:18,humidity:45,co2:450,fan:0,valve:0,occupancy:0,window:false,mode:"pid",spT:21,spC:1000,fanT:24,overheat:false,failsafe:false});
+
+/* ---- In-browser demo: JS port of simulator/house_model.py and controller/control.py ---- */
+const gauss=()=>Math.sqrt(-2*Math.log(1-Math.random()))*Math.cos(2*Math.PI*Math.random());
+const tOut=h=>10+6*Math.sin(2*Math.PI*(h-9)/24);
+function PID(kp,ki,tau,rev){let I=0,f=null;return{u(sp,m,dt){f=f===null?m:f+dt/(tau+dt)*(m-f);const e=rev?f-sp:sp-f,p=kp*e,un=p+I,o=clamp(un,0,100);
+  if(o===un||(un>100&&e<0)||(un<0&&e>0))I=clamp(I+ki*e*dt,0,100);return clamp(p+I,0,100)}}}
+function Hys(b,rev){let on=false;return{u(sp,m){const e=rev?m-sp:sp-m;if(e>b)on=true;else if(e<-b)on=false;return on?100:0}}}
+const ctrls=m=>m==="pid"?[PID(60,.02,120,false),PID(.4,.001,120,true)]:[Hys(.5,false),Hys(100,true)];
+const SP=[["living_room",75,110,1.6e6,2500,.06,[[13,17,1,0],[17,23,3,0]],21],
+ ["kitchen",35,60,.8e6,1200,.05,[[7,8,2,300],[12,13,1,300],[18,19.5,2,900]],20],
+ ["bedroom",40,70,.9e6,1500,.04,[[0,7,2,0],[23,24,2,0]],18.5],
+ ["study",30,55,.7e6,1000,.04,[[9,17,1,0]],21]];
+const NB=[[0,1],[0,2],[1,3],[2,3]];
+function makeHouse(){
+  const R=SP.map(s=>({n:s[0],V:s[1],UA:s[2],C:s[3],QH:s[4],QF:s[5],S:s[6],sp:s[7],spC:1000,fanT:24,mode:"pid",c:ctrls("pid"),
+    T:18,co2:450,rh:45,fan:0,valve:0,win:0,hot:false}));
+  return{t:17*3600,R,
+    occ(r){const h=(this.t/3600)%24;for(const[a,b,n,q]of r.S)if(h>=a&&h<b)return[n,q];return[0,0]},
+    step(){const to=tOut((this.t/3600)%24),fl=R.map(()=>0);
+      for(const[a,b]of NB){const q=30*(R[a].T-R[b].T);fl[a]-=q;fl[b]+=q}
+      R.forEach((r,i)=>{const[n,x]=this.occ(r);if(this.t>=r.win&&n>0&&Math.random()<1/21600)r.win=this.t+600;
+        const k=r.V/60,q=.005*k+r.QF*r.fan/100+(this.t<r.win?.04*k:0);
+        r.T+=((r.UA+q*1206)*(to-r.T)+n*100+x+r.QH*r.valve/100+fl[i])/r.C;
+        r.co2+=(n*5+q*(420-r.co2))/r.V;r.rh=clamp(r.rh+n*.0008+q/r.V*(60-r.rh),0,100)});
+      this.t+=1}};
+}
+
+/* ---- View ---- */
+const ROOMC={living_room:"#a9cde6",kitchen:"#f3d19c",bedroom:"#cdbfe6",study:"#a8d8b9"};
+const heat=t=>{const k=clamp((t-16)/10,0,1),d=Math.abs(k-.5)*2;return`hsl(${k<.5?205:25} ${Math.round(22+63*d)}% ${Math.round(84-34*d)}%)`};
+
+function Plan({rooms,sel,setSel}){
+  const doors=[[386,100,8,40],[120,206,50,8],[480,206,50,8],[286,270,8,40]];
+  return(<svg className="plan" viewBox="0 18 640 364" role="group" aria-label="Floor plan">
+    {Object.entries(GEO).map(([n,[x,y,w,h]])=>{const r=rooms[n]||blank(),on=sel===n,top=y<100;
+      const dur=r.fan>1?`${(2.4-2.1*r.fan/100).toFixed(2)}s`:"0s";
+      return(<g key={n} className="room" tabIndex="0" role="button" aria-label={`${NAMES[n]}, ${r.temperature.toFixed(1)} degrees`} aria-pressed={on}
+        onClick={()=>setSel(n)} onKeyDown={e=>(e.key==="Enter"||e.key===" ")&&setSel(n)}>
+        <rect x={x} y={y} width={w} height={h} fill={ROOMC[n]} stroke="#1b2b3a" strokeWidth="3"/>
+        <rect x={x} y={y} width={w} height="12" fill={heat(r.temperature)} stroke="#1b2b3a" strokeOpacity=".25" pointerEvents="none"/>
+        <rect x={x} y={y} width={w} height={h} fill="#6b7782" opacity={clamp((r.co2-420)/1600,0,1)*.42} pointerEvents="none"/>
+        {r.window&&<rect x={x+w/2-30} y={top?25:y+h-5} width="60" height="10" fill="#fff" stroke="#1b2b3a" strokeWidth="2"/>}
+        <text x={x+16} y={y+28} fontSize="16" fontWeight="600" fill="#1b2b3a">{NAMES[n]}</text>
+        <text x={x+16} y={y+66} fontSize="32" fontWeight="500" fill="#1b2b3a" fontFamily="DM Mono,monospace">{r.temperature.toFixed(1)}°</text>
+        <text x={x+16} y={y+88} fontSize="12" fill="#1b2b3a">CO2 {Math.round(r.co2)} ppm{r.overheat?" · cooling":""}</text>
+        <text x={x+16} y={y+h-26} fontSize="12" fill="#1b2b3a">valve {r.valve.toFixed(0)}% · fan {r.fan.toFixed(0)}%</text>
+        <rect x={x+16} y={y+h-18} width={w-32} height="6" fill="none" stroke="#1b2b3a" strokeWidth="1.2"/>
+        <rect x={x+16} y={y+h-18} width={(w-32)*clamp(r.valve,0,100)/100} height="6" fill="#e0572d"/>
+        {Array.from({length:r.occupancy},(_,i)=><g key={i} transform={`translate(${x+w-26-i*22} ${y+26})`}><circle r="6" cy="-5" fill="#1b2b3a"/><path d="M-9 10Q0-6 9 10Z" fill="#1b2b3a"/></g>)}
+        <g transform={`translate(${x+w-34} ${y+h-44})`}><circle r="17" fill="#f8fafb" stroke="#1b2b3a" strokeWidth="1.5"/>
+          <g className="fan" style={{"--d":dur}}>{[0,90,180,270].map(a=><path key={a} transform={`rotate(${a}) scale(.55)`} d="M0 0C4-22 20-28 24-14C14-14 6-8 0 0Z" fill="#1b2b3a"/>)}</g></g>
+      </g>)})}
+    {GEO[sel]&&<rect x={GEO[sel][0]} y={GEO[sel][1]} width={GEO[sel][2]} height={GEO[sel][3]} fill="none" stroke="#1b2b3a" strokeWidth="8" pointerEvents="none"/>}
+    {doors.map(([x,y,w,h],i)=><rect key={i} x={x} y={y} width={w} height={h} fill="#f8fafb" pointerEvents="none"/>)}
+  </svg>);
+}
+
+function Chart({data,k,sp,min,max,color,unit}){
+  const W=520,H=130,P=6,n=Math.max(data.length,2);
+  const X=i=>P+i*(W-2*P)/(n-1),Y=v=>H-P-(clamp(v,min,max)-min)/(max-min)*(H-2*P);
+  const path=data.map((r,i)=>`${i?"L":"M"}${X(i).toFixed(1)} ${Y(r[k]).toFixed(1)}`).join("");
+  return(<svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",display:"block"}} role="img" aria-label={`${k} chart`}>
+    <rect width={W} height={H} fill="#eef2f4"/>
+    <line x1="0" x2={W} y1={Y(sp)} y2={Y(sp)} stroke="#1b2b3a" strokeDasharray="5 4" strokeWidth="1.2"/>
+    <path d={path} fill="none" stroke={color} strokeWidth="2.4" strokeLinejoin="round"/>
+    <text x={W-6} y={Y(sp)-5} textAnchor="end" fontSize="11" fill="#1b2b3a">setpoint {sp}{unit}</text>
+  </svg>);
+}
+
+function App(){
+  const [rooms,setRooms]=useState({}), [hist,setHist]=useState({}), [meta,setMeta]=useState({sim:"--:--",outdoor:10});
+  const [sel,setSel]=useState("living_room"), [src,setSrc]=useState("connecting");
+  const cur=useRef({}), mt=useRef({sim:"--:--",outdoor:10}), cli=useRef(null), demo=useRef(null), got=useRef(false);
+
+  const startDemo=()=>{
+    if(demo.current)return; setSrc("demo");
+    const H=makeHouse(), map={spT:"sp",spC:"spC",fanT:"fanT"};
+    demo.current={set(n,k,v){const r=H.R.find(r=>r.n===n);if(!r)return;if(k==="mode"){r.mode=v;r.c=ctrls(v)}else r[map[k]]=v}};
+    setInterval(()=>{
+      for(let i=0;i<60;i++)H.step();
+      const h=(H.t/3600)%24; mt.current={sim:`${String(Math.floor(h)).padStart(2,"0")}:${String(Math.floor(h%1*60)).padStart(2,"0")}`,outdoor:tOut(h)};
+      H.R.forEach(r=>{
+        const T=r.T+gauss()*.1,co2=r.co2+gauss()*10;
+        let v=r.c[0].u(r.sp,T,60),f=r.c[1].u(r.spC,co2,60);
+        if(T>=r.fanT)r.hot=true;else if(T<=r.fanT-.5)r.hot=false;
+        if(r.hot){f=100;v=0}
+        r.fan=f;r.valve=v;
+        cur.current[r.n]={temperature:T,humidity:r.rh+gauss()*.5,co2,fan:f,valve:v,occupancy:H.occ(r)[0],window:H.t<r.win,mode:r.mode,spT:r.sp,spC:r.spC,fanT:r.fanT,overheat:r.hot,failsafe:false};
+      });
+    },1000);
+  };
+
+  useEffect(()=>{   // once per second: push state to the screen and append to the history
+    const id=setInterval(()=>{const c=cur.current,ks=Object.keys(c);if(!ks.length)return;
+      setRooms(Object.fromEntries(ks.map(k=>[k,{...c[k]}]))); setMeta({...mt.current});
+      setHist(h=>{const n={...h};ks.forEach(k=>{n[k]=[...(n[k]||[]).slice(-149),{temperature:c[k].temperature,co2:c[k].co2}]});return n});},1000);
+    return()=>clearInterval(id);
+  },[]);
+
+  useEffect(()=>{
+    if(Q.has("demo")||typeof mqtt==="undefined"){startDemo();return;}
+    let c; const fb=()=>{if(!got.current){try{c&&c.end(true)}catch(e){}startDemo();}};
+    try{c=mqtt.connect(`ws://${HOST}:9001`,{reconnectPeriod:0,connectTimeout:3000});}catch(e){fb();return;}
+    cli.current=c; const t=setTimeout(fb,4500);
+    c.on("connect",()=>c.subscribe([`${BASE}/+/sensor`,`${BASE}/+/status`,`${BASE}/+/control/status`]));
+    c.on("error",fb);
+    c.on("message",(topic,buf)=>{
+      const [n,...kind]=topic.slice(BASE.length+1).split("/"), k=kind.join("/"); let j; try{j=JSON.parse(buf.toString())}catch(e){return}
+      const o=cur.current[n]||(cur.current[n]=blank());
+      if(k==="control/status"){o.mode=j.mode;o.spT=j.sp_temp;o.spC=j.sp_co2;o.fanT=j.fan_on_temp;o.overheat=j.overheat;o.failsafe=j.failsafe;}
+      else if(k==="status"){o.fan=j.fan;o.valve=j.valve;o.occupancy=j.occupancy;o.window=j.window_open;mt.current={sim:j.sim_time,outdoor:j.outdoor_temp};}
+      else if(k==="sensor"){o.temperature=j.temperature;o.humidity=j.humidity;o.co2=j.co2;got.current=true;clearTimeout(t);setSrc("live");}
+    });
+    return()=>{clearTimeout(t);try{c.end(true)}catch(e){}};
+  },[]);
+
+  const r=rooms[sel]||blank(), data=hist[sel]||[];
+  const setv=(key,topic,val)=>{
+    cur.current[sel]={...(cur.current[sel]||blank()),[key]:val};
+    if(demo.current)demo.current.set(sel,key,val); else if(cli.current&&src==="live")cli.current.publish(`${BASE}/${sel}/${topic}`,String(val));
+  };
+
+  return(<div className="wrap">
+    <header>
+      <div><h1>Smart home climate control</h1><p>Four rooms, each with its own PID loop driving a heating valve and a ventilation fan. Click a room.</p></div>
+      <span className={"badge "+(src==="live"?"live":"demo")}><span className="dot"/>{src==="live"?"Live: MQTT connected":src==="demo"?"Demo: in-browser simulation":"Connecting…"}</span>
+    </header>
+    <div className="grid">
+      <div className="card"><h2>Floor plan · time {meta.sim} · outside {meta.outdoor.toFixed(1)} °C <span style={{color:"var(--mute)",fontWeight:400}}>· top strip = temperature: blue cold, grey comfortable, orange warm</span></h2><Plan rooms={rooms} sel={sel} setSel={setSel}/></div>
+      <div className="card ctl" style={{borderTop:`6px solid ${ROOMC[sel]}`}}><h2>{NAMES[sel]}</h2>
+        <div className="stats">
+          <div className="stat"><b>{r.temperature.toFixed(1)}<small> °C</small></b><span>Temperature</span></div>
+          <div className="stat"><b style={{color:r.co2>1100?"#c2412d":"inherit"}}>{Math.round(r.co2)}<small> ppm</small></b><span>CO2</span></div>
+          <div className="stat"><b>{r.humidity.toFixed(0)}<small> %</small></b><span>Humidity</span></div>
+          <div className="stat"><b style={{fontSize:20,paddingTop:6}}>{r.failsafe?"fail-safe":r.overheat?"cooling":"normal"}</b><span>Control state</span></div>
+        </div>
+        <label>Temperature setpoint <output>{r.spT.toFixed(1)} °C</output></label>
+        <input type="range" min="16" max="26" step=".5" value={r.spT} onChange={e=>setv("spT","setpoint/temperature",+e.target.value)} aria-label="Temperature setpoint"/>
+        <label>CO2 setpoint <output>{Math.round(r.spC)} ppm</output></label>
+        <input type="range" min="600" max="1500" step="50" value={r.spC} onChange={e=>setv("spC","setpoint/co2",+e.target.value)} aria-label="CO2 setpoint"/>
+        <label>Fan-on temperature <output>{r.fanT.toFixed(1)} °C</output></label>
+        <input type="range" min="22" max="30" step=".5" value={r.fanT} onChange={e=>setv("fanT","setpoint/fan_on_temp",+e.target.value)} aria-label="Fan-on temperature"/>
+        <label>Control method</label>
+        <div className="seg"><button aria-pressed={r.mode==="pid"} onClick={()=>setv("mode","control/mode","pid")}>PID</button><button aria-pressed={r.mode==="onoff"} onClick={()=>setv("mode","control/mode","onoff")}>On / off</button></div>
+      </div>
+    </div>
+    <div className="charts">
+      <div className="card" style={{borderTop:`6px solid ${ROOMC[sel]}`}}><div className="cap"><b style={{color:"var(--ink)"}}>{NAMES[sel]}: temperature</b><span>last {data.length} samples</span></div><Chart data={data} k="temperature" sp={r.spT} min={14} max={28} color="#d9702c" unit="°C"/></div>
+      <div className="card" style={{borderTop:`6px solid ${ROOMC[sel]}`}}><div className="cap"><b style={{color:"var(--ink)"}}>{NAMES[sel]}: CO2</b><span>ppm</span></div><Chart data={data} k="co2" sp={r.spC} min={400} max={1800} color="#3a8fb7" unit=" ppm"/></div>
+    </div>
+  </div>);
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>

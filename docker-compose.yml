@@ -1,0 +1,97 @@
+name: smart-home-climate
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: climate-mosquitto
+    ports:
+      - "1883:1883"   # MQTT
+      - "9001:9001"   # MQTT over WebSocket (used by dashboard/index.html)
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    restart: unless-stopped
+
+  simulator:
+    build: ./simulator
+    container_name: climate-simulator
+    depends_on:
+      - mosquitto
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      BASE_TOPIC: building/f1      # room topics: building/f1/<living_room|kitchen|bedroom|study>/...
+      SPEED: ${SPEED:-60}          # 1 real second = SPEED simulated seconds
+      START_HOUR: "17"             # the simulation starts at 17:00
+      PUBLISH_EVERY: "1.0"         # publish period in real seconds
+    restart: unless-stopped
+
+  controller:
+    build: ./controller
+    container_name: climate-controller
+    depends_on:
+      - mosquitto
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      BASE_TOPIC: building/f1
+      SPEED: ${SPEED:-60}          # must match the simulator (used for dt)
+      MODE: pid                    # pid | onoff
+      SP_TEMP: "21"                # fallback; per-room defaults live in controller.py
+      SP_CO2: "1000"
+      FAN_ON_TEMP: "24"            # the ventilation fan turns on at this temperature
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    container_name: climate-postgres
+    environment:
+      POSTGRES_USER: climate
+      POSTGRES_PASSWORD: climate
+      POSTGRES_DB: climate
+    ports:
+      - "5433:5432"   # host port 5433 avoids clashing with a local PostgreSQL
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U climate -d climate"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  logger:
+    build: ./logger
+    container_name: climate-logger
+    depends_on:
+      mosquitto:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      BASE_TOPIC: building
+      PG_DSN: "host=postgres dbname=climate user=climate password=climate"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: climate-grafana
+    depends_on:
+      - postgres
+    ports:
+      - "3000:3000"
+    environment:
+      # Local development only: no login, opens straight to the dashboard (do not expose to the internet)
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/home.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  grafana-data:
